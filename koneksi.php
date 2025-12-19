@@ -1,6 +1,6 @@
 <?php
-$servername = "localhost";
-$database = "fpdwo";
+$servername = "127.0.0.1";
+$database = "dw_adventureworks";
 $username = "root";
 $password = "";
 
