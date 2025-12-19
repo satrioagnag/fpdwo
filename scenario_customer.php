@@ -1,13 +1,14 @@
 <?php
 include 'koneksi.php';
-set_time_limit(120);
 
-// Optimize connection for large queries
-mysqli_query($conn, "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'");
-mysqli_query($conn, "SET SESSION tmp_table_size=256*1024*1024");
-mysqli_query($conn, "SET SESSION max_heap_table_size=256*1024*1024");
+// kalau project kamu pakai session_start di index.php dan sering hang,
+// pastikan di index.php kamu ada session_write_close() setelah cek auth.
 
-function fetchData(mysqli $conn, string $query): array {
+set_time_limit(60);
+@mysqli_query($conn, "SET SESSION net_read_timeout=30");
+@mysqli_query($conn, "SET SESSION net_write_timeout=30");
+
+function fetchData(mysqli $conn, string $query, int $maxRows = 5000): array {
     $result = mysqli_query($conn, $query);
     if (!$result) {
         error_log("SQL ERROR: " . mysqli_error($conn));
@@ -16,62 +17,86 @@ function fetchData(mysqli $conn, string $query): array {
     $rows = [];
     while ($row = mysqli_fetch_assoc($result)) {
         $rows[] = $row;
+        if (count($rows) >= $maxRows) break;
     }
     mysqli_free_result($result);
     return $rows;
 }
 
-// Get max year once
-$maxYearRow = fetchData($conn, "SELECT MAX(Year) AS max_year FROM dimdate");
+/* ========= 1) Tahun terbaru + range DateKey ========= */
+$maxYearRow = fetchData($conn, "SELECT MAX(Year) AS max_year FROM dimdate", 1);
 $maxYear = (int)($maxYearRow[0]['max_year'] ?? 2001);
 
-// OPTIMIZED: Single query with pre-aggregation and limiting
-$categoryDetail = fetchData($conn, "
-  SELECT
-    CASE
-      WHEN dp.ReorderPoint <= 200 THEN 'Komponen'
-      WHEN dp.ReorderPoint <= 500 THEN 'Aksesoris'
-      ELSE 'Produk Jadi'
-    END AS category,
-    dc.CustomerType AS segment,
-    dp.ProductName AS product,
-    SUM(fs.OrderQuantity) AS qty,
-    SUM(fs.OrderCount) AS freq
-  FROM factsales fs
-  STRAIGHT_JOIN dimdate dd ON fs.DateKey = dd.DateKey
-  STRAIGHT_JOIN dimproduct dp ON fs.ProductKey = dp.ProductKey
-  STRAIGHT_JOIN dimcustomer dc ON fs.CustomerKey = dc.CustomerKey
-  WHERE dd.Year = $maxYear
-  GROUP BY 
-    CASE
-      WHEN dp.ReorderPoint <= 200 THEN 'Komponen'
-      WHEN dp.ReorderPoint <= 500 THEN 'Aksesoris'
-      ELSE 'Produk Jadi'
-    END,
-    dc.CustomerType,
-    fs.ProductKey,
-    dp.ProductName
-  ORDER BY freq DESC
-  LIMIT 200
-");
+$rangeRow = fetchData($conn, "SELECT MIN(DateKey) AS min_k, MAX(DateKey) AS max_k FROM dimdate WHERE Year = $maxYear", 1);
+$minDateKey = (int)($rangeRow[0]['min_k'] ?? 0);
+$maxDateKey = (int)($rangeRow[0]['max_k'] ?? 0);
 
-// Process in PHP (more efficient than multiple SQL queries)
+if ($minDateKey === 0 || $maxDateKey === 0) {
+    die("DateKey range not found for Year=$maxYear");
+}
+
+/* ========= 2) Caching (biar reload gak nembak DB terus) ========= */
+$cacheFile = __DIR__ . "/cache_customer_$maxYear.json";
+if (file_exists($cacheFile) && (time() - filemtime($cacheFile) < 600)) {
+    $cached = json_decode(file_get_contents($cacheFile), true);
+    $categoryDetail = $cached['categoryDetail'] ?? [];
+} else {
+    /* ========= 3) STEP A: ambil Top ProductKey dulu (CEPAT) ========= */
+    $topProducts = fetchData($conn, "
+        SELECT fs.ProductKey, SUM(fs.OrderCount) AS freq
+        FROM factsales fs
+        WHERE fs.DateKey BETWEEN $minDateKey AND $maxDateKey
+        GROUP BY fs.ProductKey
+        ORDER BY freq DESC
+        LIMIT 30
+    ", 100);
+
+    $productKeys = array_map(fn($r) => (int)$r['ProductKey'], $topProducts);
+    if (!$productKeys) $productKeys = [0];
+    $inKeys = implode(',', $productKeys);
+
+    /* ========= 4) STEP B: detail hanya untuk 30 produk itu (KENCENG) ========= */
+    $categoryDetail = fetchData($conn, "
+        SELECT
+          CASE
+            WHEN dp.ReorderPoint <= 200 THEN 'Komponen'
+            WHEN dp.ReorderPoint <= 500 THEN 'Aksesoris'
+            ELSE 'Produk Jadi'
+          END AS category,
+          dc.CustomerType AS segment,
+          dp.ProductName AS product,
+          SUM(fs.OrderQuantity) AS qty,
+          SUM(fs.OrderCount) AS freq
+        FROM factsales fs
+        JOIN dimproduct dp  ON fs.ProductKey  = dp.ProductKey
+        JOIN dimcustomer dc ON fs.CustomerKey = dc.CustomerKey
+        WHERE fs.DateKey BETWEEN $minDateKey AND $maxDateKey
+          AND fs.ProductKey IN ($inKeys)
+        GROUP BY fs.ProductKey, dc.CustomerType, category, dp.ProductName
+        ORDER BY freq DESC
+        LIMIT 800
+    ", 1200);
+
+    @file_put_contents($cacheFile, json_encode([
+        'categoryDetail' => $categoryDetail
+    ]));
+}
+
+/* ========= 5) Derive dataset lain dari detail (tanpa query tambahan) ========= */
 $categoryFrequencyMap = [];
 $segmentTotalsMap = [];
 
 foreach ($categoryDetail as $r) {
     $cat = $r['category'];
     $seg = $r['segment'];
-    
-    // Aggregate frequency
+    $freq = (float)$r['freq'];
+    $qty  = (float)$r['qty'];
+
     $key = $cat . '||' . $seg;
-    $categoryFrequencyMap[$key] = ($categoryFrequencyMap[$key] ?? 0) + (float)$r['freq'];
-    
-    // Aggregate totals
-    $segmentTotalsMap[$seg] = ($segmentTotalsMap[$seg] ?? 0) + (float)$r['qty'];
+    $categoryFrequencyMap[$key] = ($categoryFrequencyMap[$key] ?? 0) + $freq;
+    $segmentTotalsMap[$seg] = ($segmentTotalsMap[$seg] ?? 0) + $qty;
 }
 
-// Convert to arrays for JSON
 $categoryFrequency = [];
 foreach ($categoryFrequencyMap as $key => $val) {
     [$cat, $seg] = explode('||', $key);
@@ -82,7 +107,6 @@ $segmentTotals = [];
 foreach ($segmentTotalsMap as $seg => $val) {
     $segmentTotals[] = ['segment' => $seg, 'total_qty' => $val];
 }
-
 ?>
 
 <main>
@@ -99,7 +123,7 @@ foreach ($segmentTotalsMap as $seg => $val) {
         <div class="card mb-4">
           <div class="card-header">Order frequency per kategori & segmen (tahun <?= htmlspecialchars((string)$maxYear) ?>)</div>
           <div class="card-body">
-            <canvas id="categoryStacked" height="280"></canvas>
+            <canvas id="categoryStacked" height="160"></canvas>
           </div>
         </div>
       </div>
@@ -108,7 +132,7 @@ foreach ($segmentTotalsMap as $seg => $val) {
         <div class="card mb-4">
           <div class="card-header">Distribusi total order qty per segmen</div>
           <div class="card-body">
-            <canvas id="segmentPie" height="280"></canvas>
+            <canvas id="segmentPie" height="260"></canvas>
           </div>
         </div>
       </div>
@@ -125,6 +149,7 @@ foreach ($segmentTotalsMap as $seg => $val) {
                 <th>Kategori</th>
                 <th>Segmen</th>
                 <th>Produk</th>
+                <th class="text-end">Freq</th>
                 <th class="text-end">Qty</th>
               </tr>
             </thead>
@@ -133,6 +158,7 @@ foreach ($segmentTotalsMap as $seg => $val) {
         </div>
       </div>
     </div>
+
   </div>
 </main>
 
@@ -143,7 +169,7 @@ const categoryFrequency = <?= json_encode($categoryFrequency, JSON_NUMERIC_CHECK
 const segmentTotals     = <?= json_encode($segmentTotals, JSON_NUMERIC_CHECK) ?>;
 const categoryDetail    = <?= json_encode($categoryDetail, JSON_NUMERIC_CHECK) ?>;
 
-console.log('customer data lengths', categoryFrequency.length, segmentTotals.length, categoryDetail.length);
+console.log('customer lengths', categoryFrequency.length, segmentTotals.length, categoryDetail.length);
 </script>
 
 <script>
@@ -167,11 +193,12 @@ document.addEventListener('DOMContentLoaded', function () {
         <td>${r.category}</td>
         <td>${r.segment}</td>
         <td>${r.product}</td>
+        <td class="text-end">${fmt(r.freq)}</td>
         <td class="text-end">${fmt(r.qty)}</td>
       </tr>
     `).join('');
 
-    tbody.innerHTML = rows || `<tr><td colspan="4" class="text-center">Tidak ada data</td></tr>`;
+    tbody.innerHTML = rows || `<tr><td colspan="5" class="text-center">Tidak ada data</td></tr>`;
   }
 
   function resetFilter() {
@@ -183,20 +210,23 @@ document.addEventListener('DOMContentLoaded', function () {
 
   document.getElementById('btnResetCustomerFilter')?.addEventListener('click', resetFilter);
 
+  // categories + segments
   const categories = [...new Set(categoryFrequency.map(i => i.category))];
   const segments   = [...new Set(categoryFrequency.map(i => i.segment))];
 
+  // O(1) lookup: no find() loops
   const freqMap = new Map();
   categoryFrequency.forEach(r => {
     freqMap.set(`${r.category}||${r.segment}`, Number(r.frequency));
   });
 
+  const baseColor = (seg, alpha) =>
+    seg === 'Individual' ? `rgba(54,162,235,${alpha})` : `rgba(255,99,132,${alpha})`;
+
   const datasets = segments.map(seg => ({
     label: seg,
     data: categories.map(cat => freqMap.get(`${cat}||${seg}`) || 0),
-    backgroundColor: seg === 'Individual'
-      ? 'rgba(54,162,235,0.55)'
-      : 'rgba(255,99,132,0.55)'
+    backgroundColor: categories.map(() => baseColor(seg, 0.55))
   }));
 
   const categoryStacked = new Chart(
@@ -211,11 +241,7 @@ document.addEventListener('DOMContentLoaded', function () {
           y: { stacked: true, beginAtZero: true }
         },
         plugins: {
-          tooltip: {
-            callbacks: {
-              label: (ctx) => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}`
-            }
-          }
+          tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` } }
         },
         onClick: (_, elements) => {
           if (!elements.length) return;
@@ -261,11 +287,10 @@ document.addEventListener('DOMContentLoaded', function () {
 
   function refreshHighlights() {
     categoryStacked.data.datasets.forEach(ds => {
-      const base = ds.label === 'Individual' ? 'rgba(54,162,235,0.55)' : 'rgba(255,99,132,0.55)';
       ds.backgroundColor = categories.map(cat => {
         const hitCat = !selectedCategory || cat === selectedCategory;
         const hitSeg = !selectedSegment  || ds.label === selectedSegment;
-        return (hitCat && hitSeg) ? base.replace('0.55','0.85') : base.replace('0.55','0.25');
+        return (hitCat && hitSeg) ? baseColor(ds.label, 0.85) : baseColor(ds.label, 0.20);
       });
     });
     categoryStacked.update();

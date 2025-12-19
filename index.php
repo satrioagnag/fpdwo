@@ -90,7 +90,7 @@ flush();
                 <footer class="py-4 bg-light mt-auto">
                     <div class="container-fluid px-4">
                         <div class="d-flex align-items-center justify-content-between small">
-                            <div class="text-muted">Copyright &copy; 2023. Dashboard Final Project DWO Kelompok 1</div>
+                            <div class="text-muted">Copyright &copy; 2025. Dashboard Final Project DWO Kelompok </div>
                         </div>
                     </div>
                 </footer>
