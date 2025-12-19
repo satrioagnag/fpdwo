@@ -1,12 +1,14 @@
 <?php
-
 include 'koneksi.php';
-set_time_limit(120); // 2 menit
-mysqli_query($conn, "SET SESSION net_read_timeout=120");
-mysqli_query($conn, "SET SESSION net_write_timeout=120");
+set_time_limit(120);
+
+// Optimize connection for large queries
+mysqli_query($conn, "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'");
+mysqli_query($conn, "SET SESSION tmp_table_size=256*1024*1024");
+mysqli_query($conn, "SET SESSION max_heap_table_size=256*1024*1024");
 
 function fetchData(mysqli $conn, string $query): array {
-    $result = mysqli_query($conn, $query); // buffered
+    $result = mysqli_query($conn, $query);
     if (!$result) {
         error_log("SQL ERROR: " . mysqli_error($conn));
         return [];
@@ -19,27 +21,11 @@ function fetchData(mysqli $conn, string $query): array {
     return $rows;
 }
 
-// Ambil tahun terbaru
+// Get max year once
 $maxYearRow = fetchData($conn, "SELECT MAX(Year) AS max_year FROM dimdate");
 $maxYear = (int)($maxYearRow[0]['max_year'] ?? 2001);
 
-$rangeRow = fetchData($conn, "SELECT MIN(DateKey) AS min_k, MAX(DateKey) AS max_k FROM dimdate WHERE Year = $maxYear");
-$minDateKey = (int)$rangeRow[0]['min_k'];
-$maxDateKey = (int)$rangeRow[0]['max_k'];
-
-$topProducts = fetchData($conn, "
-  SELECT fs.ProductKey, SUM(fs.OrderCount) AS freq
-  FROM factsales fs
-  WHERE fs.DateKey BETWEEN $minDateKey AND $maxDateKey
-  GROUP BY fs.ProductKey
-  ORDER BY freq DESC
-  LIMIT 30
-");
-
-$productKeys = array_map(fn($r)=> (int)$r['ProductKey'], $topProducts);
-if (!$productKeys) $productKeys = [0];
-$inKeys = implode(',', $productKeys);
-
+// OPTIMIZED: Single query with pre-aggregation and limiting
 $categoryDetail = fetchData($conn, "
   SELECT
     CASE
@@ -52,29 +38,40 @@ $categoryDetail = fetchData($conn, "
     SUM(fs.OrderQuantity) AS qty,
     SUM(fs.OrderCount) AS freq
   FROM factsales fs
-  JOIN dimproduct dp  ON fs.ProductKey  = dp.ProductKey
-  JOIN dimcustomer dc ON fs.CustomerKey = dc.CustomerKey
-  WHERE fs.DateKey BETWEEN $minDateKey AND $maxDateKey
-    AND fs.ProductKey IN ($inKeys)
-  GROUP BY fs.ProductKey, dc.CustomerType, category, dp.ProductName
+  STRAIGHT_JOIN dimdate dd ON fs.DateKey = dd.DateKey
+  STRAIGHT_JOIN dimproduct dp ON fs.ProductKey = dp.ProductKey
+  STRAIGHT_JOIN dimcustomer dc ON fs.CustomerKey = dc.CustomerKey
+  WHERE dd.Year = $maxYear
+  GROUP BY 
+    CASE
+      WHEN dp.ReorderPoint <= 200 THEN 'Komponen'
+      WHEN dp.ReorderPoint <= 500 THEN 'Aksesoris'
+      ELSE 'Produk Jadi'
+    END,
+    dc.CustomerType,
+    fs.ProductKey,
+    dp.ProductName
   ORDER BY freq DESC
+  LIMIT 200
 ");
-$categoryFrequencyMap = []; // key: category||segment => frequency
-$segmentTotalsMap = [];    // key: segment => total qty
+
+// Process in PHP (more efficient than multiple SQL queries)
+$categoryFrequencyMap = [];
+$segmentTotalsMap = [];
 
 foreach ($categoryDetail as $r) {
     $cat = $r['category'];
     $seg = $r['segment'];
-
-    // frequency per kategori+segmen (pakai SUM(OrderCount))
+    
+    // Aggregate frequency
     $key = $cat . '||' . $seg;
     $categoryFrequencyMap[$key] = ($categoryFrequencyMap[$key] ?? 0) + (float)$r['freq'];
-
-    // total qty per segmen
+    
+    // Aggregate totals
     $segmentTotalsMap[$seg] = ($segmentTotalsMap[$seg] ?? 0) + (float)$r['qty'];
 }
 
-// bentuk array untuk JSON
+// Convert to arrays for JSON
 $categoryFrequency = [];
 foreach ($categoryFrequencyMap as $key => $val) {
     [$cat, $seg] = explode('||', $key);
@@ -139,10 +136,8 @@ foreach ($segmentTotalsMap as $seg => $val) {
   </div>
 </main>
 
-<!-- Chart.js v3+ (samain dengan scenario_revenue.php) -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
 
-<!-- Inject JSON -->
 <script>
 const categoryFrequency = <?= json_encode($categoryFrequency, JSON_NUMERIC_CHECK) ?>;
 const segmentTotals     = <?= json_encode($segmentTotals, JSON_NUMERIC_CHECK) ?>;
@@ -151,16 +146,13 @@ const categoryDetail    = <?= json_encode($categoryDetail, JSON_NUMERIC_CHECK) ?
 console.log('customer data lengths', categoryFrequency.length, segmentTotals.length, categoryDetail.length);
 </script>
 
-<!-- Logic & Charts -->
 <script>
 document.addEventListener('DOMContentLoaded', function () {
   const fmt = (n) => Number(n).toLocaleString();
 
-  // ---------- state ----------
   let selectedCategory = null;
   let selectedSegment  = null;
 
-  // ---------- table ----------
   const tbody = document.querySelector('#categoryTable tbody');
 
   function renderTable() {
@@ -191,33 +183,22 @@ document.addEventListener('DOMContentLoaded', function () {
 
   document.getElementById('btnResetCustomerFilter')?.addEventListener('click', resetFilter);
 
-  // ---------- prepare categories & segments ----------
   const categories = [...new Set(categoryFrequency.map(i => i.category))];
   const segments   = [...new Set(categoryFrequency.map(i => i.segment))];
 
+  const freqMap = new Map();
+  categoryFrequency.forEach(r => {
+    freqMap.set(`${r.category}||${r.segment}`, Number(r.frequency));
+  });
+
   const datasets = segments.map(seg => ({
     label: seg,
-    data: categories.map(cat => {
-const freqMap = new Map();
-categoryFrequency.forEach(r => {
-  freqMap.set(`${r.category}||${r.segment}`, Number(r.frequency));
-});
-
-const datasets = segments.map(seg => ({
-  label: seg,
-  data: categories.map(cat => freqMap.get(`${cat}||${seg}`) || 0),
-  backgroundColor: seg === 'Individual'
-    ? 'rgba(54,162,235,0.55)'
-    : 'rgba(255,99,132,0.55)'
-}));
-      return row ? Number(row.frequency) : 0;
-    }),
+    data: categories.map(cat => freqMap.get(`${cat}||${seg}`) || 0),
     backgroundColor: seg === 'Individual'
       ? 'rgba(54,162,235,0.55)'
       : 'rgba(255,99,132,0.55)'
   }));
 
-  // ---------- stacked bar ----------
   const categoryStacked = new Chart(
     document.getElementById('categoryStacked'),
     {
@@ -248,7 +229,6 @@ const datasets = segments.map(seg => ({
     }
   );
 
-  // ---------- doughnut ----------
   const segmentPie = new Chart(
     document.getElementById('segmentPie'),
     {
@@ -280,7 +260,6 @@ const datasets = segments.map(seg => ({
   );
 
   function refreshHighlights() {
-    // highlight bar chart by dimming others
     categoryStacked.data.datasets.forEach(ds => {
       const base = ds.label === 'Individual' ? 'rgba(54,162,235,0.55)' : 'rgba(255,99,132,0.55)';
       ds.backgroundColor = categories.map(cat => {
@@ -292,7 +271,6 @@ const datasets = segments.map(seg => ({
     categoryStacked.update();
   }
 
-  // init
   renderTable();
   refreshHighlights();
 });

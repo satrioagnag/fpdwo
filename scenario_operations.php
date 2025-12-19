@@ -1,8 +1,13 @@
 <?php
 include 'koneksi.php';
 
+// Optimize MySQL session
+mysqli_query($conn, "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'");
+mysqli_query($conn, "SET SESSION tmp_table_size=256*1024*1024");
+mysqli_query($conn, "SET SESSION max_heap_table_size=256*1024*1024");
+
 function fetchData(mysqli $conn, string $query): array {
-    $result = mysqli_query($conn, $query); // buffered
+    $result = mysqli_query($conn, $query);
     if (!$result) {
         error_log("SQL ERROR: " . mysqli_error($conn));
         return [];
@@ -15,29 +20,42 @@ function fetchData(mysqli $conn, string $query): array {
     return $rows;
 }
 
-// Tahun terbaru
+// Get max year
 $maxYearRow = fetchData($conn, "SELECT MAX(Year) AS max_year FROM dimdate");
 $maxYear = (int)($maxYearRow[0]['max_year'] ?? 2001);
 
-// Filter tanggal 1 tahun (hindari join dimdate berat di factsales)
-$dateKeyFilter = "fs.DateKey IN (SELECT DateKey FROM dimdate WHERE Year = $maxYear)";
-
-// 1) Sales performance (orders vs revenue) per salesperson
+// OPTIMIZED: Sales performance with STRAIGHT_JOIN and limited results
 $salesPerformance = fetchData($conn, "
     SELECT 
         dsp.SalesPersonName AS salesperson, 
         SUM(fs.OrderCount) AS orders, 
         SUM(fs.TotalRevenue) AS revenue
     FROM factsales fs
-    JOIN dimsalesperson dsp ON fs.SalesPersonKey = dsp.SalesPersonKey
-    WHERE $dateKeyFilter
+    STRAIGHT_JOIN dimdate dd ON fs.DateKey = dd.DateKey
+    STRAIGHT_JOIN dimsalesperson dsp ON fs.SalesPersonKey = dsp.SalesPersonKey
+    WHERE dd.Year = $maxYear
       AND dsp.SalesPersonName IS NOT NULL
-    GROUP BY dsp.SalesPersonName
+      AND dsp.SalesPersonName != ''
+    GROUP BY dsp.SalesPersonKey, dsp.SalesPersonName
     ORDER BY revenue DESC
     LIMIT 15
 ");
 
-// 2) Drill detail per salesperson (top products)
+// OPTIMIZED: Only get top salesperson keys to limit detail query
+$topSalesKeys = array_map(function($r) use ($conn) {
+    // Get the key for this salesperson
+    $name = mysqli_real_escape_string($conn, $r['salesperson']);
+    $keyRow = mysqli_fetch_assoc(mysqli_query($conn, 
+        "SELECT SalesPersonKey FROM dimsalesperson WHERE SalesPersonName = '$name' LIMIT 1"
+    ));
+    return $keyRow['SalesPersonKey'] ?? 0;
+}, $salesPerformance);
+
+$topSalesKeys = array_filter($topSalesKeys);
+if (empty($topSalesKeys)) $topSalesKeys = [0];
+$salesKeyList = implode(',', $topSalesKeys);
+
+// OPTIMIZED: Detail query only for top salespersons
 $salespersonDetail = fetchData($conn, "
     SELECT
         dsp.SalesPersonName AS salesperson,
@@ -45,32 +63,38 @@ $salespersonDetail = fetchData($conn, "
         SUM(fs.OrderQuantity) AS qty,
         SUM(fs.TotalRevenue) AS revenue
     FROM factsales fs
-    JOIN dimsalesperson dsp ON fs.SalesPersonKey = dsp.SalesPersonKey
-    JOIN dimproduct dp ON fs.ProductKey = dp.ProductKey
-    WHERE $dateKeyFilter
-      AND dsp.SalesPersonName IS NOT NULL
-    GROUP BY dsp.SalesPersonName, dp.ProductName
+    STRAIGHT_JOIN dimdate dd ON fs.DateKey = dd.DateKey
+    STRAIGHT_JOIN dimsalesperson dsp ON fs.SalesPersonKey = dsp.SalesPersonKey
+    STRAIGHT_JOIN dimproduct dp ON fs.ProductKey = dp.ProductKey
+    WHERE dd.Year = $maxYear
+      AND fs.SalesPersonKey IN ($salesKeyList)
+    GROUP BY fs.SalesPersonKey, dsp.SalesPersonName, fs.ProductKey, dp.ProductName
+    HAVING revenue > 0
     ORDER BY revenue DESC
-    LIMIT 500
+    LIMIT 300
 ");
 
-// 3) Low inventory (dari factinventory + dimproduct threshold)
-$lowStock = fetchData($conn, "SELECT
+// OPTIMIZED: Low inventory using subquery for max date
+$lowStock = fetchData($conn, "
+    SELECT
         dp.ProductName AS product,
-        SUM(fi.EndOfDayQuantity) AS qty,
+        fi.EndOfDayQuantity AS qty,
         dp.ReorderPoint AS reorder_point,
-        dp.SafetyStockLevel AS safety_stock
+        dp.SafetyStockLevel AS safety_stock,
+        (dp.ReorderPoint - fi.EndOfDayQuantity) AS shortage
     FROM factinventory fi
-    JOIN dimproduct dp ON fi.ProductKey = dp.ProductKey
+    STRAIGHT_JOIN dimproduct dp ON fi.ProductKey = dp.ProductKey
     WHERE fi.DateKey = (
         SELECT MAX(fi2.DateKey)
         FROM factinventory fi2
-        JOIN dimdate dd ON fi2.DateKey = dd.DateKey
+        STRAIGHT_JOIN dimdate dd ON fi2.DateKey = dd.DateKey
         WHERE dd.Year = $maxYear
     )
-    GROUP BY dp.ProductName, dp.ReorderPoint, dp.SafetyStockLevel
-    HAVING qty < reorder_point OR qty < safety_stock
-    ORDER BY (reorder_point - qty) DESC
+    AND (
+        fi.EndOfDayQuantity < dp.ReorderPoint 
+        OR fi.EndOfDayQuantity < dp.SafetyStockLevel
+    )
+    ORDER BY shortage DESC
     LIMIT 20
 ");
 ?>
@@ -141,7 +165,6 @@ console.log('ops data lengths', salesPerformance.length, salespersonDetail.lengt
 document.addEventListener('DOMContentLoaded', function () {
   const fmt = (n) => Number(n).toLocaleString();
 
-  // -------- table drilldown --------
   const tbody = document.querySelector('#salesTable tbody');
   let selectedSales = null;
 
@@ -166,7 +189,6 @@ document.addEventListener('DOMContentLoaded', function () {
 
   document.getElementById('btnResetOpsFilter')?.addEventListener('click', resetDrill);
 
-  // -------- Chart 1: mixed axis (orders + revenue) --------
   const labels = salesPerformance.map(i => i.salesperson);
 
   const salespersonChart = new Chart(
@@ -225,7 +247,6 @@ document.addEventListener('DOMContentLoaded', function () {
     salespersonChart.update();
   }
 
-  // -------- Chart 2: low inventory horizontal --------
   const inventoryChart = new Chart(
     document.getElementById('inventoryChart'),
     {
@@ -252,7 +273,6 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   );
 
-  // init
   renderSalesTable();
 });
 </script>
